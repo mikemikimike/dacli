@@ -319,8 +319,12 @@ def _import_extension(name: str, init_path: Path):
         # edit that keeps the file's size and mtime-second would otherwise reuse a
         # stale __pycache__ entry and run the old code. module_from_spec already
         # set __path__, so sibling imports still resolve.
-        code = compile(init_path.read_text(encoding="utf-8"), str(init_path), "exec")
+        source = init_path.read_text(encoding="utf-8")
+        code = compile(source, str(init_path), "exec")
         exec(code, module.__dict__)
+        module.__dacli_loaded_source_hash__ = hashlib.sha256(
+            source.encode("utf-8")
+        ).hexdigest()
     except BaseException:
         sys.modules.pop(mod_name, None)
         raise
@@ -479,7 +483,9 @@ if spec is None or spec.loader is None:
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 try:
-    spec.loader.exec_module(mod)
+    source = Path(path).read_text(encoding="utf-8")
+    code = compile(source, path, "exec")
+    exec(code, mod.__dict__)
 except Exception as exc:
     _verdict(False, f"import failed: {exc}")
 
@@ -657,6 +663,7 @@ class ExtensionHost:
         self.registry = ExtensionRegistry()
         self._good: dict[str, ExtensionAPI] = {}
         self._fingerprints: dict[str, str] = {}
+        self._source_hashes: dict[str, str] = {}
         self._failed: dict[str, str] = {}
 
     def _base(self) -> Path:
@@ -666,6 +673,12 @@ class ExtensionHost:
         """Where extensions live for this host — the generator writes here before
         :meth:`reload`."""
         return self._base()
+
+    def source_hash(self, name: str) -> str | None:
+        """Return the SHA-256 of the source currently adopted for ``name``."""
+        if name not in self._good:
+            return None
+        return self._source_hashes.get(name)
 
     def load(self) -> ReloadResult:
         return self._sync(reason="startup", shutdown=False)
@@ -688,6 +701,7 @@ class ExtensionHost:
             if name not in discovered:
                 del self._good[name]
                 self._fingerprints.pop(name, None)
+                self._source_hashes.pop(name, None)
                 self._failed.pop(name, None)
                 result.removed.append(name)
 
@@ -704,13 +718,14 @@ class ExtensionHost:
                 result.failed[name] = message
                 continue
             try:
-                api = self._import_and_register(name, init_path)
+                api, source_hash = self._import_and_register(name, init_path)
             except Exception as exc:
                 self._failed[name] = f"load error: {exc}"
                 result.failed[name] = self._failed[name]
                 continue
             self._good[name] = api
             self._fingerprints[name] = fp
+            self._source_hashes[name] = source_hash
             self._failed.pop(name, None)
             (result.reloaded if known else result.loaded).append(name)
 
@@ -718,8 +733,11 @@ class ExtensionHost:
         self._emit("session_start", reason)
         return result
 
-    def _import_and_register(self, name: str, init_path: Path) -> ExtensionAPI:
+    def _import_and_register(self, name: str, init_path: Path) -> tuple[ExtensionAPI, str]:
         module = _import_extension(name, init_path)
+        source_hash = getattr(module, "__dacli_loaded_source_hash__", None)
+        if not isinstance(source_hash, str):
+            raise RuntimeError("extension loader did not record the loaded source hash")
         register = getattr(module, "register", None)
         if not callable(register):
             raise ImportError("module exports no register(api)")
@@ -727,7 +745,7 @@ class ExtensionHost:
             name, config_provider=self._config_provider, session_log=self.log
         )
         register(api)
-        return api
+        return api, source_hash
 
     def _rebuild(self) -> None:
         registry = ExtensionRegistry()

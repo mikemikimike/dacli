@@ -8,9 +8,14 @@ append-only session log and replays it from its ``session_start`` handler.
 """
 
 import asyncio
+import os
 from textwrap import dedent
 
-from dacli.core.extensions import ExtensionHost, ToolContext
+from dacli.core.extensions import (
+    ExtensionHost,
+    ToolContext,
+    _validate_extension_in_subprocess,
+)
 
 
 def _write_ext(root, name, body):
@@ -127,6 +132,35 @@ def test_broken_edit_is_not_imported_into_the_process(tmp_path):
 
     assert "sample" in result.failed
     assert not marker.exists()
+
+
+def test_validator_executes_current_source_not_stale_bytecode(tmp_path):
+    package = tmp_path / "sample"
+    package.mkdir()
+    init_file = package / "__init__.py"
+    marker = tmp_path / "validated.txt"
+    source = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text(\"old\")\n"
+        "def register(api):\n"
+        "    pass\n"
+    )
+    init_file.write_text(source, encoding="utf-8")
+    ok, message = _validate_extension_in_subprocess("sample", init_file)
+    assert ok, message
+    assert marker.read_text(encoding="utf-8") == "old"
+
+    marker.unlink()
+    stat = init_file.stat()
+    updated = source.replace('write_text("old")', 'write_text("new")')
+    assert len(updated) == len(source)
+    init_file.write_text(updated, encoding="utf-8")
+    os.utime(init_file, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    ok, message = _validate_extension_in_subprocess("sample", init_file)
+
+    assert ok, message
+    assert marker.read_text(encoding="utf-8") == "new"
 
 
 def test_session_state_survives_reload(tmp_path):
