@@ -553,9 +553,15 @@ class Governor:
 
         # 6. Dry-run preview (best-effort).
         preview = None
+        preview_error = None
         preview_metadata: dict[str, Any] = {}
         if policy.requires_dry_run or requires_preview:
-            preview = await self._dry_run(connector, tool_name, args)
+            try:
+                preview = await self._dry_run(
+                    connector, tool_name, args, required=bool(requires_preview)
+                )
+            except Exception as exc:
+                preview_error = str(exc)
             preview_metadata = await self._dry_run_metadata(
                 connector, tool_name, args
             )
@@ -563,6 +569,8 @@ class Governor:
                 reason = (
                     f"blocked: approval preview for '{tool_name}' is unavailable"
                 )
+                if preview_error:
+                    reason += f": {preview_error}"
                 discard_preview = getattr(connector, "discard_dry_run", None)
                 if callable(discard_preview):
                     try:
@@ -744,7 +752,8 @@ class Governor:
         return estimate if isinstance(estimate, dict) else None
 
     async def _dry_run(
-        self, connector: Any, tool_name: str, args: dict[str, Any]
+        self, connector: Any, tool_name: str, args: dict[str, Any],
+        *, required: bool = False,
     ) -> str | None:
         if self._dry_run_fn is not None:
             try:
@@ -753,6 +762,9 @@ class Governor:
                     preview = await preview
                 return str(preview) if preview is not None else None
             except Exception:
+                if required:
+                    raise
+                log.debug("dry_run_fn raised", exc_info=True)
                 return None
         hook = getattr(connector, "dry_run", None)
         if callable(hook):
@@ -762,6 +774,9 @@ class Governor:
                     preview = await preview
                 return str(preview) if preview is not None else None
             except Exception:
+                if required:
+                    raise
+                log.debug("dry_run hook raised", exc_info=True)
                 return None
         return "(no dry-run available for this connector)"
 

@@ -458,7 +458,9 @@ async def generate_extension(
         if missing and ui.confirm(f"Install '{missing}' with pip?"):
             installed = _pip_install(missing)
             if installed:
-                reload_result = host.reload()
+                reload_result = host.reload(
+                    expected_hashes={prepared.name: prepared.source_sha256}
+                )
                 if prepared.name not in reload_result.failed:
                     return GenerationResult(
                         prepared.name,
@@ -530,7 +532,7 @@ def apply_prepared_extension(prepared: PreparedExtension, host: Any) -> Generati
             f"extension '{prepared.name}' source hash changed while applying the approved source"
         )
 
-    result = host.reload()
+    result = host.reload(expected_hashes={prepared.name: prepared.source_sha256})
     if prepared.name in result.failed:
         return GenerationResult(
             prepared.name,

@@ -4,10 +4,13 @@ import asyncio
 import hashlib
 from textwrap import dedent
 
+import pytest
+
 from dacli.connectors.registry import ConnectorRegistry
 from dacli.connectors.system.connector import SystemConnector, _AutoUI
 from dacli.connectors.base import Risk, ToolStatus
 from dacli.connectors.dispatcher import Dispatcher
+from dacli.core import extensions
 from dacli.core.extensions import ExtensionHost
 from dacli.core.verify import Verifier
 from dacli.governance.audit import AuditLedger
@@ -234,3 +237,85 @@ def test_autonomous_clarification_requires_explicit_input():
     ui = _AutoUI(lambda _question: next(answers))
     assert ui.confirm("Install dependency?") is True
     assert ui.select("Transport?", ["http", "cli"]) == "http"
+
+
+@pytest.mark.parametrize("tool_name", ["generate_connector", "edit_extension"])
+@pytest.mark.parametrize("when", ["before_validation", "after_validation"])
+def test_replaced_source_never_executes(tmp_path, monkeypatch, tool_name, when):
+    _disable_context_docs(monkeypatch)
+    host = ExtensionHost(tmp_path / "extensions")
+    source_path = host.base_dir() / "sample" / "__init__.py"
+    if tool_name == "edit_extension":
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text(MODULE_V1, encoding="utf-8")
+        host.load()
+    original_hash = host.source_hash("sample")
+    marker = tmp_path / "unreviewed.txt"
+    replacement = (
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('ran')\n"
+        + MODULE_V1
+    )
+    system, dispatcher = _system_dispatcher(
+        tmp_path, ScriptedLLM(_module_block(MODULE_V2)), host,
+        approval=lambda request: True,
+    )
+    validation_calls = []
+    validate = extensions._validate_extension_in_subprocess
+    reload = host.reload
+
+    def validate_then_replace(*args):
+        result = validate(*args)
+        validation_calls.append(result[0])
+        source_path.write_text(replacement, encoding="utf-8")
+        return result
+
+    def replace_then_reload(*args, **kwargs):
+        source_path.write_text(replacement, encoding="utf-8")
+        return reload(*args, **kwargs)
+
+    if when == "before_validation":
+        monkeypatch.setattr(host, "reload", replace_then_reload)
+    else:
+        monkeypatch.setattr(extensions, "_validate_extension_in_subprocess", validate_then_replace)
+
+    args = {"name": "sample", "description": "sample service", "instruction": "Improve description"}
+    result = _run(dispatcher.execute(tool_name, args))
+    message = result.error or result.data.get("validation_message") or result.data.get("message", "")
+
+    assert (
+        marker.exists(), host.source_hash("sample"),
+        "changed" in message, system._pending_previews, validation_calls,
+    ) == (False, original_hash, True, {}, [True] if when == "after_validation" else [])
+
+
+@pytest.mark.parametrize("tool_name,name,response,expected", [
+    ("generate_connector", "sample", "", "already exists"),
+    ("edit_extension", "missing", "", "not found"),
+    ("generate_connector", " ", "", "'name' and 'description' are required"),
+    ("generate_connector", "new", "no module", "neither a module nor a clarification"),
+    ("generate_connector", "new", _module_block(
+        'def register(api):\n    api.config_field("token", secret=True, default="literal")\n'
+    ), "secret field 'token'"),
+])
+def test_preview_errors_keep_the_cause(tmp_path, monkeypatch, tool_name, name, response, expected):
+    _disable_context_docs(monkeypatch)
+    host = ExtensionHost(tmp_path / "extensions")
+    source_path = host.base_dir() / "sample" / "__init__.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(MODULE_V1, encoding="utf-8")
+    original = source_path.read_bytes()
+    approvals = []
+    system, dispatcher = _system_dispatcher(
+        tmp_path, ScriptedLLM(response), host,
+        approval=lambda request: approvals.append(request) or True,
+    )
+    result = _run(dispatcher.execute(tool_name, {
+        "name": name, "description": "sample service", "instruction": "Improve description",
+    }))
+
+    assert (
+        result.status, expected in result.error, approvals,
+        system._pending_previews, source_path.read_bytes(),
+        (host.base_dir() / "new").exists(),
+    ) == (ToolStatus.BLOCKED, True, [], {}, original, False)

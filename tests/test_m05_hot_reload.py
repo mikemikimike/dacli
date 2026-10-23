@@ -14,6 +14,7 @@ from textwrap import dedent
 from dacli.core.extensions import (
     ExtensionHost,
     ToolContext,
+    _import_extension,
     _validate_extension_in_subprocess,
 )
 
@@ -161,6 +162,47 @@ def test_validator_executes_current_source_not_stale_bytecode(tmp_path):
 
     assert ok, message
     assert marker.read_text(encoding="utf-8") == "new"
+
+
+def test_validator_uses_captured_source(tmp_path):
+    init_file = tmp_path / "__init__.py"
+    marker = tmp_path / "unreviewed.txt"
+    init_file.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('ran')\n"
+        "def register(api):\n    pass\n",
+        encoding="utf-8",
+    )
+    source = 'def register(api):\n    if "雪" != chr(38634):\n        raise ValueError("wrong encoding")\n'
+
+    ok, message = _validate_extension_in_subprocess("sample", init_file, source)
+
+    assert (ok, message, marker.exists()) == (True, "valid", False)
+
+
+def test_import_uses_captured_source(tmp_path):
+    init_file = tmp_path / "__init__.py"
+    marker = tmp_path / "unreviewed.txt"
+    init_file.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+
+    module = _import_extension("sample", init_file, 'value = "雪"\n')
+
+    assert (module.value, marker.exists()) == ("雪", False)
+
+
+def test_invalid_utf8_is_isolated(tmp_path):
+    init_file = tmp_path / "sample" / "__init__.py"
+    init_file.parent.mkdir()
+    init_file.write_bytes(b"\xff")
+    host = ExtensionHost(tmp_path)
+
+    result = host.load()
+
+    assert ("sample" in result.failed, host.registry.extension_ids()) == (True, [])
 
 
 def test_session_state_survives_reload(tmp_path):
